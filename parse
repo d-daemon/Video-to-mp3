@@ -1,0 +1,82 @@
+import logging
+from bs4 import BeautifulSoup
+from email import policy
+from email.parser import BytesParser
+from email.header import decode_header
+import quopri
+import pandas as pd
+from utils import read_file_from_gcs, write_file_to_gcs, extract_stream_id
+from logger import get_logger
+from data_quality import sanitize_filename
+import config
+from pathlib import Path
+
+logger = get_logger(__name__)
+
+def decode_filename(filename):
+    """
+    Decode filename from email headers that might be UTF-8 encoded
+    
+    Args:
+        filename: The filename from email Content-Disposition
+        
+    Returns:
+        str: Decoded filename
+    """
+    try:
+        # decode_header returns a list of (decoded_string, charset) pairs
+        decoded_parts = decode_header(filename)
+        decoded_filename = ''
+        
+        for part, charset in decoded_parts:
+            if isinstance(part, bytes):
+                # If charset is not provided, default to utf-8
+                decoded_filename += part.decode(charset or 'utf-8', errors='replace')
+            else:
+                decoded_filename += str(part)
+                
+        return decoded_filename
+    except Exception as e:
+        logger.error(f"Error decoding filename {filename}: {str(e)}")
+        return filename  # Return original if decoding fails
+
+def parse_email(file_path, attachment_folder):
+    """Parse a single .eml file."""
+    messages_data = []
+    attachments_data = []
+    attachment_ids = set()
+    unique_message_ids = set()
+    
+    try:
+        file_content = read_file_from_gcs(file_path)
+        msg = BytesParser(policy=policy.default).parsebytes(file_content)
+        
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get('Content-Disposition', '').startswith('attachment'):
+                    try:
+                        attachment_name = part.get_filename()
+                        if attachment_name:
+                            # Decode the filename properly
+                            decoded_name = decode_filename(attachment_name)
+                            sanitized_attachment_name = sanitize_filename(decoded_name)
+                            
+                            attachment_content_id = part.get('Content-ID', '').strip('<>')
+                            content_id_match = extract_attachment_content_id(attachment_content_id)
+                            
+                            if content_id_match:
+                                sanitized_content_id = sanitize_filename(content_id_match)
+                                attachment_ids.add(content_id_match)
+                                new_filename = f"{sanitized_content_id}_{sanitized_attachment_name}"
+                                attachment_path = f"{attachment_folder}/{new_filename}"
+                                
+                                write_file_to_gcs(attachment_path, part.get_payload(decode=True))
+                                attachments_data.append({
+                                    'email_id': Path(file_path).stem,
+                                    'content_id': content_id_match,
+                                    'attachment_name': sanitized_attachment_name,
+                                })
+                    except Exception as e:
+                        logger.error(f"Error extracting attachment {attachment_name} from file {file_path}: {e}")
+                        return pd.DataFrame(), pd.DataFrame()
+            
